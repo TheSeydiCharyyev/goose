@@ -16,13 +16,17 @@ if exist "%GOOSE_NODE_DIR%\node-v%NODE_VERSION%.installed" (
 
 REM === Use a system Node.js from PATH ===
 REM Look for node.exe, not npx.cmd: a bare npx.cmd lookup can find this wrapper.
+REM A broken npm install fails "npx --version", so the next candidate or the download is used.
 for /f "delims=" %%N in ('where $PATH:node.exe 2^>nul') do (
     if exist "%%~dpNnpx.cmd" (
         "%%N" -e "process.exit(parseInt(process.versions.node) >= %MIN_SYSTEM_NODE_MAJOR% ? 0 : 1)" <nul >nul 2>&1
         if "!errorlevel!"=="0" (
-            SET "PATH=%%~dpN;!PATH!"
-            "%%~dpNnpx.cmd" %*
-            exit /b !errorlevel!
+            call "%%~dpNnpx.cmd" --version <nul >nul 2>&1
+            if "!errorlevel!"=="0" (
+                SET "PATH=%%~dpN;!PATH!"
+                "%%~dpNnpx.cmd" %*
+                exit /b !errorlevel!
+            )
         )
     )
 )

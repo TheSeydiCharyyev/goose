@@ -9,7 +9,11 @@ const wrapperPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'bin
 const system32 = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32');
 
 // Stands in for npm's npx.cmd: runs the node.exe next to it, like the real one does.
-const fakeNpx = '@ECHO OFF\r\n"%~dp0node.exe" "%FAKE_NPX_REPORT%" %*\r\n';
+const fakeNpx =
+  '@ECHO OFF\r\nif "%~1"=="--version" exit /b 0\r\n"%~dp0node.exe" "%FAKE_NPX_REPORT%" %*\r\n';
+
+// The last line of npm's real npx.cmd. Without node_modules next to it, npm is incomplete.
+const brokenNpx = '@ECHO OFF\r\n"%~dp0node.exe" "%~dp0node_modules\\npm\\bin\\npx-cli.js" %*\r\n';
 
 const reportSource = `
 const chunks = [];
@@ -37,6 +41,7 @@ describe.skipIf(process.platform !== 'win32')('Windows npx wrapper', () => {
   let systemNodeDir: string;
   let nodeWithoutNpxDir: string;
   let failingNodeDir: string;
+  let brokenNpmDir: string;
   let portableNodeDir: string;
   let emptyNodeDir: string;
 
@@ -96,6 +101,10 @@ describe.skipIf(process.platform !== 'win32')('Windows npx wrapper', () => {
     fs.copyFileSync(path.join(system32, 'where.exe'), path.join(failingNodeDir, 'node.exe'));
     fs.writeFileSync(path.join(failingNodeDir, 'npx.cmd'), fakeNpx);
 
+    brokenNpmDir = makeDir('broken npm');
+    fs.linkSync(path.join(systemNodeDir, 'node.exe'), path.join(brokenNpmDir, 'node.exe'));
+    fs.writeFileSync(path.join(brokenNpmDir, 'npx.cmd'), brokenNpx);
+
     portableNodeDir = makeDir('portable node');
     fs.linkSync(path.join(systemNodeDir, 'node.exe'), path.join(portableNodeDir, 'node.exe'));
     fs.writeFileSync(path.join(portableNodeDir, 'npx.cmd'), fakeNpx);
@@ -129,6 +138,14 @@ describe.skipIf(process.platform !== 'win32')('Windows npx wrapper', () => {
     expect(child.stdin).toBe('first line\nsecond line\n');
   });
 
+  it('skips a Node.js whose npx does not run', () => {
+    const result = runWrapper({ pathDirs: [brokenNpmDir, systemNodeDir], args: ['-y', 'pkg'] });
+
+    expect(result.stderr).not.toContain('Downloading');
+    expect(result.status).toBe(0);
+    expect((JSON.parse(result.stdout) as ChildReport).nodeDir).toBe(systemNodeDir);
+  });
+
   it('propagates the npx exit status', () => {
     const result = runWrapper({ pathDirs: [systemNodeDir], args: ['-y', 'pkg'], exitCode: 37 });
 
@@ -152,6 +169,7 @@ describe.skipIf(process.platform !== 'win32')('Windows npx wrapper', () => {
     ['no node.exe', () => []],
     ['node.exe without npx.cmd next to it', () => [nodeWithoutNpxDir]],
     ['node.exe that fails the version check', () => [failingNodeDir]],
+    ['node.exe whose npx does not run', () => [brokenNpmDir]],
   ])('falls back to the download when PATH has %s', (_name, pathDirs) => {
     const result = runWrapper({ pathDirs: pathDirs(), args: ['-y', 'pkg'] });
 
