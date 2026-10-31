@@ -55,7 +55,7 @@ fn with_path_root(test: impl FnOnce(&Path)) {
 #[test]
 #[serial]
 fn new_and_rotated_request_logs_are_owner_only_under_any_umask() {
-    for mask in [0o022, 0o000] {
+    for mask in [0o022, 0o000, 0o400] {
         with_path_root(|root| {
             let _umask = Umask::set(mask);
             let log = RequestLog::new(LOGS_TO_KEEP).unwrap();
@@ -120,6 +120,30 @@ fn permissive_logs_from_older_versions_are_tightened_and_kept() {
         );
         assert_eq!(mode(&logs_dir.join("notes.txt")), 0o644);
         assert_eq!(mode(&state_dir), 0o755);
+    });
+}
+
+#[test]
+#[serial]
+fn logs_without_owner_read_permission_are_tightened_and_kept() {
+    with_path_root(|root| {
+        let logs_dir = root.join("state/logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+        fs::write(logs_dir.join("llm_request.0.jsonl"), "write only").unwrap();
+        chmod(&logs_dir.join("llm_request.0.jsonl"), 0o200);
+        chmod(&logs_dir, 0o300);
+
+        let log = RequestLog::new(LOGS_TO_KEEP).unwrap();
+        write_request(&log, "new");
+
+        assert_eq!(mode(&logs_dir), 0o700);
+        for name in request_logs(&logs_dir) {
+            assert_eq!(mode(&logs_dir.join(&name)), 0o600, "{name}");
+        }
+        assert_eq!(
+            fs::read_to_string(logs_dir.join("llm_request.1.jsonl")).unwrap(),
+            "write only"
+        );
     });
 }
 

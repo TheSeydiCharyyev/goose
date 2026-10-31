@@ -105,7 +105,12 @@ impl LogDir {
                 continue;
             }
             let path = self.path.join(&name);
-            let file = match self.open_at(&name, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+            let file = match self
+                .open_at(&name, libc::O_RDONLY | libc::O_NONBLOCK, 0)
+                .or_else(|error| match error.raw_os_error() {
+                    Some(libc::EACCES) => self.open_at(&name, libc::O_WRONLY | libc::O_NONBLOCK, 0),
+                    _ => Err(error),
+                }) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
@@ -123,11 +128,16 @@ impl LogDir {
     }
 
     fn create_new(&self, name: &str) -> std::io::Result<std::fs::File> {
-        self.open_at(
+        use std::os::unix::fs::PermissionsExt;
+
+        let file = self.open_at(
             name.as_ref(),
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
             0o600,
-        )
+        )?;
+        // The umask can remove owner bits from the creation mode.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        Ok(file)
     }
 
     fn open_at(

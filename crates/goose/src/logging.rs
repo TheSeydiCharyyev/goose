@@ -167,8 +167,15 @@ pub(crate) fn open_private_log_dir() -> Result<fs::File> {
         }
         _ => {}
     }
-    if fs::symlink_metadata(&log_dir)?.file_type().is_symlink() {
+    let metadata = fs::symlink_metadata(&log_dir)?;
+    if metadata.file_type().is_symlink() {
         anyhow::bail!("Log directory {} is a symbolic link", log_dir.display());
+    }
+    // The umask can remove owner bits from the creation mode, and the directory
+    // has to be readable before it can be opened.
+    if metadata.is_dir() && metadata.permissions().mode() & 0o700 != 0o700 {
+        check_log_dir_owner(&metadata, &log_dir, current_uid())?;
+        fs::set_permissions(&log_dir, fs::Permissions::from_mode(0o700))?;
     }
 
     let directory = fs::OpenOptions::new()
