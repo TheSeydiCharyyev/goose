@@ -94,7 +94,7 @@ impl LogDir {
     /// Narrows request logs left by older versions or interrupted runs to 0600, after
     /// checking that each one is a regular file owned by this user with no other links.
     fn tighten_request_logs(&self, owner: u32) -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         for entry in std::fs::read_dir(&self.path)? {
             let name = entry?.file_name();
@@ -116,14 +116,59 @@ impl LogDir {
                 Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
                     anyhow::bail!("Request log {} is a symbolic link", path.display());
                 }
+                Err(error) if error.raw_os_error() == Some(libc::EACCES) => {
+                    self.tighten_unopenable_request_log(&name, &path, owner)?;
+                    continue;
+                }
                 Err(error) => return Err(error.into()),
             };
             let metadata = file.metadata()?;
-            check_request_log(&metadata, &path, owner)?;
+            check_request_log(
+                metadata.is_file(),
+                metadata.uid(),
+                metadata.nlink() == 1,
+                &path,
+                owner,
+            )?;
             if metadata.permissions().mode() & 0o777 != 0o600 {
                 file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             }
         }
+        Ok(())
+    }
+
+    /// A request log with neither owner read nor write permission cannot be opened,
+    /// so it is checked and changed by name, relative to the directory, without
+    /// following a symlink.
+    fn tighten_unopenable_request_log(
+        &self,
+        name: &std::ffi::OsStr,
+        path: &std::path::Path,
+        owner: u32,
+    ) -> Result<()> {
+        use std::os::fd::AsRawFd;
+
+        let name = c_file_name(name)?;
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                self.handle.as_raw_fd(),
+                name.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        check_request_log(
+            (stat.st_mode & libc::S_IFMT) == libc::S_IFREG,
+            stat.st_uid,
+            stat.st_nlink == 1,
+            path,
+            owner,
+        )?;
+        crate::logging::chmod_no_follow(self.handle.as_raw_fd(), &name, 0o600)?;
         Ok(())
     }
 
@@ -199,19 +244,19 @@ fn c_file_name(name: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
 
 #[cfg(unix)]
 fn check_request_log(
-    metadata: &std::fs::Metadata,
+    is_file: bool,
+    uid: u32,
+    single_link: bool,
     path: &std::path::Path,
     owner: u32,
 ) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    if !metadata.is_file() {
+    if !is_file {
         anyhow::bail!("Request log {} is not a regular file", path.display());
     }
-    if metadata.uid() != owner {
+    if uid != owner {
         anyhow::bail!("Request log {} is owned by another user", path.display());
     }
-    if metadata.nlink() != 1 {
+    if !single_link {
         anyhow::bail!("Request log {} has other hard links", path.display());
     }
     Ok(())
@@ -326,11 +371,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(request_log_name(0));
         std::fs::write(&path, "request").unwrap();
-        let metadata = std::fs::metadata(&path).unwrap();
+        let uid = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&path).unwrap());
         let owner = crate::logging::current_uid();
 
-        assert!(check_request_log(&metadata, &path, owner).is_ok());
-        let error = check_request_log(&metadata, &path, owner + 1).unwrap_err();
+        assert!(check_request_log(true, uid, true, &path, owner).is_ok());
+        let error = check_request_log(true, uid, true, &path, owner + 1).unwrap_err();
         assert!(error.to_string().contains("owned by another user"));
     }
 }

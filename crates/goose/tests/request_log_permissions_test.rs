@@ -149,6 +149,36 @@ fn logs_without_owner_read_permission_are_tightened_and_kept() {
 
 #[test]
 #[serial]
+fn logs_without_any_owner_permission_are_tightened_and_kept() {
+    with_path_root(|root| {
+        let log = RequestLog::new(LOGS_TO_KEEP).unwrap();
+        let logs_dir = root.join("state/logs");
+        for (name, text, mode) in [
+            ("llm_request.0.jsonl", "no access", 0o000),
+            ("llm_request.1.jsonl", "others read and write", 0o066),
+        ] {
+            fs::write(logs_dir.join(name), text).unwrap();
+            chmod(&logs_dir.join(name), mode);
+        }
+
+        write_request(&log, "new");
+
+        for name in request_logs(&logs_dir) {
+            assert_eq!(mode(&logs_dir.join(&name)), 0o600, "{name}");
+        }
+        assert_eq!(
+            fs::read_to_string(logs_dir.join("llm_request.1.jsonl")).unwrap(),
+            "no access"
+        );
+        assert_eq!(
+            fs::read_to_string(logs_dir.join("llm_request.2.jsonl")).unwrap(),
+            "others read and write"
+        );
+    });
+}
+
+#[test]
+#[serial]
 fn symlinked_log_directory_is_refused_and_its_target_is_untouched() {
     with_path_root(|root| {
         let outside = tempfile::tempdir().unwrap();

@@ -154,7 +154,8 @@ fn create_log_dir(log_dir: &Path) -> std::io::Result<()> {
 /// Request logs hold full prompts, so they are created relative to this handle.
 #[cfg(unix)]
 pub(crate) fn open_private_log_dir() -> Result<fs::File> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
     let log_dir = Paths::in_state_dir("logs");
     if let Some(parent) = log_dir.parent() {
@@ -175,7 +176,13 @@ pub(crate) fn open_private_log_dir() -> Result<fs::File> {
     // has to be readable before it can be opened.
     if metadata.is_dir() && metadata.permissions().mode() & 0o700 != 0o700 {
         check_log_dir_owner(&metadata, &log_dir, current_uid())?;
-        fs::set_permissions(&log_dir, fs::Permissions::from_mode(0o700))?;
+        let path = std::ffi::CString::new(log_dir.as_os_str().as_bytes())?;
+        chmod_no_follow(libc::AT_FDCWD, &path, 0o700).with_context(|| {
+            format!(
+                "Failed to change the mode of log directory {}",
+                log_dir.display()
+            )
+        })?;
     }
 
     let directory = fs::OpenOptions::new()
@@ -183,12 +190,32 @@ pub(crate) fn open_private_log_dir() -> Result<fs::File> {
         .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(&log_dir)
         .with_context(|| format!("Failed to open log directory {}", log_dir.display()))?;
-    let metadata = directory.metadata()?;
-    check_log_dir_owner(&metadata, &log_dir, current_uid())?;
-    if metadata.permissions().mode() & 0o777 != 0o700 {
+    let opened = directory.metadata()?;
+    if (opened.dev(), opened.ino()) != (metadata.dev(), metadata.ino()) {
+        anyhow::bail!(
+            "Log directory {} changed while it was being opened",
+            log_dir.display()
+        );
+    }
+    check_log_dir_owner(&opened, &log_dir, current_uid())?;
+    if opened.permissions().mode() & 0o777 != 0o700 {
         directory.set_permissions(fs::Permissions::from_mode(0o700))?;
     }
     Ok(directory)
+}
+
+/// Changes the mode of `name` relative to `dir`, but fails instead of following a
+/// symlink, so a path that was swapped after it was checked cannot redirect it.
+#[cfg(unix)]
+pub(crate) fn chmod_no_follow(
+    dir: libc::c_int,
+    name: &std::ffi::CStr,
+    mode: libc::mode_t,
+) -> std::io::Result<()> {
+    if unsafe { libc::fchmodat(dir, name.as_ptr(), mode, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -353,5 +380,27 @@ mod tests {
         assert!(check_log_dir_owner(&metadata, dir.path(), current_uid()).is_ok());
         let error = check_log_dir_owner(&metadata, dir.path(), current_uid() + 1).unwrap_err();
         assert!(error.to_string().contains("owned by another user"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chmod_no_follow_leaves_a_symlink_target_alone() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, "outside").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("link");
+        symlink(&target, &link).unwrap();
+
+        let link = std::ffi::CString::new(link.as_os_str().as_bytes()).unwrap();
+        let _ = chmod_no_follow(libc::AT_FDCWD, &link, 0o700);
+
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
     }
 }
